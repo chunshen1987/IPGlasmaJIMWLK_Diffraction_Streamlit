@@ -44,6 +44,7 @@ def main():
     paraDict = parse_model_parameter_file(modelParamFile)
     st.sidebar.header('Model Parameters:')
     params = []     # record the model parameter values
+    Kfactors = np.array([1., 1., 1., 1.])
     for ikey in paraDict.keys():
         parMin = paraDict[ikey][0]
         parMax = paraDict[ikey][1]
@@ -53,7 +54,12 @@ def main():
                                    value=parInit,
                                    step=(parMax - parMin)/1000.,
                                    format='%f')
-        params.append(parVal)
+        if ikey not in ['KP', 'KPb']:
+            params.append(parVal)
+        elif ikey == 'KP':
+            Kfactors[2:] = parVal
+        elif ikey == 'KPb':
+            Kfactors[:2] = parVal
     params = np.array([params,])
 
     pred = np.array([])
@@ -61,16 +67,17 @@ def main():
     for i, emu_i in enumerate(emuList):
         modelPred, modelPredCov = emu_i.predict(params, return_cov=True)
         if i == 0:
-            pred = np.concatenate((pred, modelPred[0, :]))
-            predErr = np.concatenate(
-                (predErr, np.sqrt(np.diagonal(modelPredCov[0, :, :])))
-            )
+            predLoc = modelPred[0, :]*Kfactors[i]   
+            predErrLoc = (np.sqrt(np.diagonal(modelPredCov[0, :, :]))
+                          *Kfactors[i])
+            pred = np.concatenate((pred, predLoc))
+            predErr = np.concatenate((predErr, predErrLoc))
         else:
-            pred = np.concatenate((pred, np.exp(modelPred[0, :])))
-            predErr = np.concatenate(
-                (predErr, np.exp(modelPred[0, :])
-                          *np.sqrt(np.diagonal(modelPredCov[0, :, :])))
-            )
+            predLoc = np.exp(modelPred[0, :])*Kfactors[i]
+            predErrLoc = (np.sqrt(np.diagonal(modelPredCov[0, :, :]))
+                          *np.exp(modelPred[0, :])*Kfactors[i])
+            pred = np.concatenate((pred, predLoc))
+            predErr = np.concatenate((predErr, predErrLoc))
 
     idx0 = 0
     idx = idx0 + 13
