@@ -3,6 +3,7 @@ import pickle
 import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
+from os import path
 
 
 def parse_model_parameter_file(parfile):
@@ -28,7 +29,7 @@ def loadEmulators():
     ]
     emus = []
     for emu_i in emulatorList:
-        with open(emu_i, 'rb') as f:
+        with open(path.join("emulators", emu_i), 'rb') as f:
             emus.append(pickle.load(f))
     return emus
 
