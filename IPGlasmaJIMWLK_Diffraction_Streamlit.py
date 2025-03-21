@@ -4,6 +4,7 @@ import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
 from os import path
+import subprocess
 
 
 def parse_model_parameter_file(parfile):
@@ -21,6 +22,7 @@ def parse_model_parameter_file(parfile):
 
 @st.cache_resource
 def loadEmulators():
+    result = subprocess.run(['./downloadEmulators.sh'])
     emulatorList = [
         "emulator_PCGP_set1_closure.pkl",
         "emulator_PCGP_set2_closure.pkl",
