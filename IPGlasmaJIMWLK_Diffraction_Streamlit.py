@@ -22,7 +22,7 @@ def parse_model_parameter_file(parfile):
 
 @st.cache_resource
 def loadEmulators():
-    result = subprocess.run(['./downloadEmulators.sh'])
+    result = subprocess.call('bash downloadEmulators.sh', shell=True)
     emulatorList = [
         "emulator_PCGP_set1_closure.pkl",
         "emulator_PCGP_set2_closure.pkl",
