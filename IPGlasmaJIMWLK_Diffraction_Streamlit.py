@@ -47,21 +47,20 @@ def main():
     st.sidebar.header('Model Parameters:')
     params = []     # record the model parameter values
     Kfactors = np.array([1., 1., 1., 1.])
-    for ikey in paraDict.keys():
+    parInit = [1.146, 8.3105, 0.5204, 3., 0.9880, 0.2098,
+               0.1738, 0.0224, 0., 1., 0.196]
+    for i, ikey in enumerate(paraDict.keys()):
         parMin = paraDict[ikey][0]
         parMax = paraDict[ikey][1]
-        parInit = (parMax + parMin) / 2
         parVal = st.sidebar.slider(label=ikey,
                                    min_value=parMin, max_value=parMax,
-                                   value=parInit,
+                                   value=parInit[i],
                                    step=(parMax - parMin)/1000.,
                                    format='%f')
-        if ikey not in ['KP', 'KPb']:
+        if ikey not in ['K']:
             params.append(parVal)
-        elif ikey == 'KP':
-            Kfactors[2:] = parVal
-        elif ikey == 'KPb':
-            Kfactors[:2] = parVal
+        else:
+            Kfactors = parVal*np.ones(4)
     params = np.array([params,])
 
     pred = np.array([])
