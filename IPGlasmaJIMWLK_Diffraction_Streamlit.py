@@ -24,10 +24,10 @@ def parse_model_parameter_file(parfile):
 def loadEmulators():
     result = subprocess.call('bash downloadEmulators.sh', shell=True)
     emulatorList = [
-        "emulator_PCGP_set1_closure.pkl",
-        "emulator_PCGP_set2_closure.pkl",
-        "emulator_PCGP_set3_closure.pkl",
-        "emulator_PCGP_set4_closure.pkl",
+        "emulator_PCGP_set1.pkl",
+        "emulator_PCGP_set2.pkl",
+        "emulator_PCGP_set3.pkl",
+        "emulator_scikit_set4_noPCA.pkl",
     ]
     emus = []
     for emu_i in emulatorList:
