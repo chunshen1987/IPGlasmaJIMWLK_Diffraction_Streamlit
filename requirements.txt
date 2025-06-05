@@ -1,6 +1,6 @@
-numpy 2.0.0
+numpy
 joblib
-matplotlib 3.9.1
+matplotlib
 scikit-learn
 streamlit
 surmise
