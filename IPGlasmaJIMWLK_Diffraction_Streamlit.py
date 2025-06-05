@@ -47,8 +47,8 @@ def main():
     st.sidebar.header('Model Parameters:')
     params = []     # record the model parameter values
     Kfactors = np.array([1., 1., 1., 1.])
-    parInit = [1.146, 8.3105, 0.5204, 3., 0.9880, 0.2098,
-               0.1738, 0.0224, 0., 1., 0.196]
+    parInit = [0.435973, 3.54350, 0.17917, 3., 1.02946, 0.40889,
+               0.356598, 0.039970, 0., 1., 0.37618]
     for i, ikey in enumerate(paraDict.keys()):
         parMin = paraDict[ikey][0]
         parMax = paraDict[ikey][1]
