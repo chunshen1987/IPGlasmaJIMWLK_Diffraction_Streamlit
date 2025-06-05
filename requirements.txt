@@ -1,6 +1,6 @@
 numpy==2.0.0
 joblib
 matplotlib==3.9.1
-scikit-learn==1.4.0
+scikit-learn
 streamlit
 surmise==0.2.1
