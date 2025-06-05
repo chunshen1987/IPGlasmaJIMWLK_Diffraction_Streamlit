@@ -67,18 +67,11 @@ def main():
     predErr = np.array([])
     for i, emu_i in enumerate(emuList):
         modelPred, modelPredCov = emu_i.predict(params, return_cov=True)
-        if i == 0:
-            predLoc = modelPred[0, :]*Kfactors[i]   
-            predErrLoc = (np.sqrt(np.diagonal(modelPredCov[0, :, :]))
-                          *Kfactors[i])
-            pred = np.concatenate((pred, predLoc))
-            predErr = np.concatenate((predErr, predErrLoc))
-        else:
-            predLoc = np.exp(modelPred[0, :])*Kfactors[i]
-            predErrLoc = (np.sqrt(np.diagonal(modelPredCov[0, :, :]))
-                          *np.exp(modelPred[0, :])*Kfactors[i])
-            pred = np.concatenate((pred, predLoc))
-            predErr = np.concatenate((predErr, predErrLoc))
+        predLoc = np.exp(modelPred[0, :])*Kfactors[i]
+        predErrLoc = (np.sqrt(np.diagonal(modelPredCov[0, :, :]))
+                      *np.exp(modelPred[0, :])*Kfactors[i])
+        pred = np.concatenate((pred, predLoc))
+        predErr = np.concatenate((predErr, predErrLoc))
 
     idx0 = 0
     idx = idx0 + 13
