@@ -4,3 +4,4 @@ matplotlib==3.9.1
 scikit-learn
 streamlit
 surmise==0.2.1
+dill
