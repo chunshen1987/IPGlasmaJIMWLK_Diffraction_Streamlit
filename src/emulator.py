@@ -14,19 +14,15 @@ and `Gaussian process regression
 """
 
 import logging
-
 import numpy as np
+import pickle
 from os import path
 from glob import glob
-
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.gaussian_process import GaussianProcessRegressor as GPR
 from sklearn.gaussian_process import kernels
 from sklearn.model_selection import learning_curve
-#from sklearn.externals import joblib
-import joblib
-
 #from gp_extras.kernels import HeteroscedasticKernel
 from sklearn.cluster import KMeans
 
@@ -49,29 +45,26 @@ class Emulator:
     preprocessing into modular classes, to be used with an sklearn pipeline.
     The classes would also need to handle transforming uncertainties, which
     could be tricky.
-
     """
     def __init__(self, training_set_path=".", parameter_file="ABCD.txt",
-                 npc=10, nrestarts=0, retrain=False, transformDesign=False,
-                 logFlag=False):
-        self._vec_zeta_s = np.vectorize(self._zeta_over_s)
-        self.transformDesign_ = transformDesign
-        self.logFlag_ = logFlag
+                 npc=10, nrestarts=0, logTrafo=False, parameterTrafoPCA=False,
+                 max_rel_uncertainty_data=0.1, exp_and_cov_diag=False,
+                 perform_no_PCA=False):
+        self.logTrafo_ = logTrafo
+        self.parameterTrafoPCA_ = parameterTrafoPCA
+        self.max_rel_uncertainty_data_ = max_rel_uncertainty_data
+        self._load_training_data_pickle(training_set_path)
+        self.exp_and_cov_diag_ = exp_and_cov_diag
+        self.perform_no_PCA_ = perform_no_PCA
 
-        self._load_training_data(training_set_path)
-
-        if self.transformDesign_:
-            self.design_min = np.min(self.design_points, axis=0)
-            self.design_max = np.max(self.design_points, axis=0)
-        else:
-            self.pardict = parse_model_parameter_file(parameter_file)
-            self.design_min = []
-            self.design_max = []
-            for par, val in self.pardict.items():
-                self.design_min.append(val[1])
-                self.design_max.append(val[2])
-            self.design_min = np.array(self.design_min)
-            self.design_max = np.array(self.design_max)
+        self.pardict = parse_model_parameter_file(parameter_file)
+        self.design_min = []
+        self.design_max = []
+        for par, val in self.pardict.items():
+            self.design_min.append(val[1])
+            self.design_max.append(val[2])
+        self.design_min = np.array(self.design_min)
+        self.design_max = np.array(self.design_max)
 
         self.npc = npc
         self.nrestarts = nrestarts
@@ -80,116 +73,301 @@ class Emulator:
         self.scaler = StandardScaler(copy=False)
         self.pca = PCA(copy=False, whiten=True, svd_solver='full')
 
+        if self.parameterTrafoPCA_:
+            self.targetVariance = 0.99
+            # the order of the PCA trafos is important here, since the second and
+            # third trafo will update the PCA_new_design_points
+            logging.info("Prepare bulk viscosity parameter PCA ...")
+            self.paramTrafoScaler_bulk = StandardScaler()
+            self.paramTrafoPCA_bulk = PCA(n_components=self.targetVariance)# 0.99 is the minimum of explained variance
+            self.indices_zeta_s_parameters = [15,16,17,18] # zeta_max,T_zeta0,sigma_plus,sigma_minus
+            self.perform_bulk_viscosity_PCA()
+
+            logging.info("Prepare shear viscosity parameter PCA ...")
+            self.paramTrafoScaler_shear = StandardScaler()
+            self.paramTrafoPCA_shear = PCA(n_components=self.targetVariance)# 0.99 is the minimum of explained variance
+            self.indices_eta_s_parameters = [12,13,14]
+            self.perform_shear_viscosity_PCA()
+
+            logging.info("Prepare yloss parameter PCA ...")
+            self.paramTrafoScaler_yloss = StandardScaler()
+            self.paramTrafoPCA_yloss = PCA(n_components=self.targetVariance)# 0.99 is the minimum of explained variance
+            self.indices_yloss_parameters = [2,3,4]
+            self.perform_yloss_PCA()
+
+
+    def parametrization_zeta_over_s_vs_T(self,zeta_max,T_zeta0,
+                                         sigma_plus,sigma_minus,T,mu_B):
+        T_zeta_muB = T_zeta0 - 0.15*mu_B**2.
+        if T < T_zeta0:
+            return zeta_max * np.exp(-(T-T_zeta_muB)**2./(2.*sigma_minus**2.))
+        else:
+            return zeta_max * np.exp(-(T-T_zeta_muB)**2./(2.*sigma_plus**2.))
+
+
+    def parametrization_eta_over_s_vs_mu_B(self,eta_0,eta_2,eta_4,mu_B):
+        if 0. < mu_B and mu_B <= 0.2:
+            return eta_0 + (eta_2 - eta_0) * (mu_B / 0.2)
+        elif 0.2 < mu_B and mu_B < 0.4:
+            return eta_2 + (eta_4 - eta_2) * ((mu_B - 0.2) / 0.2)
+        else:
+            return eta_4
+
+
+    def parametrization_y_loss_vs_y_init(self,yloss_2,yloss_4,yloss_6,y_init):
+        if 0. < y_init and y_init <= 2.:
+            return yloss_2 * (y_init / 2.)
+        elif 2. < y_init and y_init < 4.:
+            return yloss_2 + (yloss_4 - yloss_2) * ((y_init - 2.) / 2.)
+        else:
+            return yloss_4 + (yloss_6 - yloss_4) * ((y_init - 4.) / 2.)
+
+
+    def perform_bulk_viscosity_PCA(self):
+        # get the corresponding parameters for the training points
+        bulk_viscosity_parameters = self.design_points[:,self.indices_zeta_s_parameters]
+        T_range = np.linspace(0.0, 0.5, 100)
+        data_functions = []
+        # Iterate over each parameter set
+        for p in range(self.nev):
+            # Evaluate the function for each temperature value in T_range
+            parameter_function = [self.parametrization_zeta_over_s_vs_T(
+                bulk_viscosity_parameters[p, 0], bulk_viscosity_parameters[p, 1],
+                bulk_viscosity_parameters[p, 2], bulk_viscosity_parameters[p, 3],
+                T, 0.0) for T in T_range]
+            data_functions.append(parameter_function)
+
+        data_functions = np.array(data_functions)
+        scaled_data_functions = self.paramTrafoScaler_bulk.fit_transform(data_functions)
+        self.paramTrafoPCA_bulk.fit(scaled_data_functions)
+
+        # Get the number of components needed to achieve the target variance
+        n_components = self.paramTrafoPCA_bulk.n_components_
+        logging.info(f"Bulk viscosity parameter PCA uses {n_components} PCs to explain {self.targetVariance*100}% of the variance ...")
+
+        # Get the principal components
+        # principal_components will have shape (1000, n_components)
+        principal_components = self.paramTrafoPCA_bulk.transform(scaled_data_functions)
+
+        # Modify the design points
+        self.PCA_new_design_points = np.delete(self.design_points, self.indices_zeta_s_parameters, axis=1)
+        self.PCA_new_design_points = np.concatenate((self.PCA_new_design_points, principal_components), axis=1)
+
+        # delete the parameters from the pardict and add the new ones
+        self.design_min = np.delete(self.design_min, self.indices_zeta_s_parameters)
+        self.design_max = np.delete(self.design_max, self.indices_zeta_s_parameters)
+        min_values_PC = np.min(principal_components, axis=0)
+        max_values_PC = np.max(principal_components, axis=0)
+        self.design_min = np.concatenate((self.design_min,min_values_PC))
+        self.design_max = np.concatenate((self.design_max,max_values_PC))
+
+
+    def perform_shear_viscosity_PCA(self):
+        # get the corresponding parameters for the training points
+        shear_viscosity_parameters = self.design_points[:,self.indices_eta_s_parameters]
+        mu_B_range = np.linspace(0.0, 0.6, 100)
+        data_functions = []
+        # Iterate over each parameter set
+        for p in range(self.nev):
+            # Evaluate the function for each mu_B value in mu_B_range
+            parameter_function = [self.parametrization_eta_over_s_vs_mu_B(
+                shear_viscosity_parameters[p, 0], shear_viscosity_parameters[p, 1],
+                shear_viscosity_parameters[p, 2], mu_B) for mu_B in mu_B_range]
+            data_functions.append(parameter_function)
+
+        data_functions = np.array(data_functions)
+        scaled_data_functions = self.paramTrafoScaler_shear.fit_transform(data_functions)
+        self.paramTrafoPCA_shear.fit(scaled_data_functions)
+
+        # Get the number of components needed to achieve the target variance
+        n_components = self.paramTrafoPCA_shear.n_components_
+        logging.info(f"Shear viscosity parameter PCA uses {n_components} PCs to explain {self.targetVariance*100}% of the variance ...")
+
+        # Get the principal components
+        # principal_components will have shape (1000, n_components)
+        principal_components = self.paramTrafoPCA_shear.transform(scaled_data_functions)
+
+        # Modify the design points
+        self.PCA_new_design_points = np.delete(self.PCA_new_design_points, self.indices_eta_s_parameters, axis=1)
+        self.PCA_new_design_points = np.concatenate((self.PCA_new_design_points, principal_components), axis=1)
+
+        # delete the parameters from the pardict and add the new ones
+        self.design_min = np.delete(self.design_min, self.indices_eta_s_parameters)
+        self.design_max = np.delete(self.design_max, self.indices_eta_s_parameters)
+        min_values_PC = np.min(principal_components, axis=0)
+        max_values_PC = np.max(principal_components, axis=0)
+        self.design_min = np.concatenate((self.design_min,min_values_PC))
+        self.design_max = np.concatenate((self.design_max,max_values_PC))
+
+
+    def perform_yloss_PCA(self):
+        # get the corresponding parameters for the training points
+        yloss_parameters = self.design_points[:,self.indices_yloss_parameters]
+        yinit_range = np.linspace(0.0, 6.2, 100)
+        data_functions = []
+        # Iterate over each parameter set
+        for p in range(self.nev):
+            # Evaluate the function for each value in yinit_range
+            parameter_function = [self.parametrization_y_loss_vs_y_init(
+                yloss_parameters[p, 0], yloss_parameters[p, 1],
+                yloss_parameters[p, 2], yinit) for yinit in yinit_range]
+            data_functions.append(parameter_function)
+
+        data_functions = np.array(data_functions)
+        scaled_data_functions = self.paramTrafoScaler_yloss.fit_transform(data_functions)
+        self.paramTrafoPCA_yloss.fit(scaled_data_functions)
+
+        # Get the number of components needed to achieve the target variance
+        n_components = self.paramTrafoPCA_yloss.n_components_
+        logging.info(f"yloss parameter PCA uses {n_components} PCs to explain {self.targetVariance*100}% of the variance ...")
+
+        # Get the principal components
+        # principal_components will have shape (1000, n_components)
+        principal_components = self.paramTrafoPCA_yloss.transform(scaled_data_functions)
+
+        # Modify the design points
+        self.PCA_new_design_points = np.delete(self.PCA_new_design_points, self.indices_yloss_parameters, axis=1)
+        self.PCA_new_design_points = np.concatenate((self.PCA_new_design_points, principal_components), axis=1)
+
+        # delete the parameters from the pardict and add the new ones
+        self.design_min = np.delete(self.design_min, self.indices_yloss_parameters)
+        self.design_max = np.delete(self.design_max, self.indices_yloss_parameters)
+        min_values_PC = np.min(principal_components, axis=0)
+        max_values_PC = np.max(principal_components, axis=0)
+        self.design_min = np.concatenate((self.design_min,min_values_PC))
+        self.design_max = np.concatenate((self.design_max,max_values_PC))
+
 
     def outputPCAvsParam(self):
-        logging.info('Perforing PCA ...')
+        logging.info('Performing PCA ...')
         Z = self.pca.fit_transform(
                 self.scaler.fit_transform(self.model_data)
         )[:, :self.npc]
         return(self.design_points, Z.T)
 
 
-    def trainEmulator(self, eventMask):
-        # Standardize observables and transform through PCA.  Use the first
-        # `npc` components but save the full PC transformation for later.
-        logging.info('Perforing PCA ...')
-        Z = self.pca.fit_transform(
-                self.scaler.fit_transform(self.model_data[eventMask, :])
-        )[:, :self.npc]
+    def trainEmulatorAutoMask(self, kernel_type="RBF"):
+        trainEventMask = [True]*self.nev
+        self.trainEmulator(trainEventMask, kernel_type=kernel_type)
 
-        logging.info('{} PCs explain {:.5f} of variance'.format(
-            self.npc, self.pca.explained_variance_ratio_[:self.npc].sum()
-        ))
 
-        nev, nobs = self.model_data[eventMask, :].shape
-        logging.info(
-            'Train GP emulators with {} training points ...'.format(nev))
+    def trainEmulator(self, eventMask, kernel_type="RBF"):
+        data_to_use = self.model_data[eventMask, :]
 
+        if self.perform_no_PCA_:
+            logging.info('Skipping PCA. Using raw standardized data for GP training.')
+            standardized_data = self.scaler.fit_transform(data_to_use)
+            Z = standardized_data
+            logging.info('Standardized data has shape: {}'.format(Z.shape))
+        else:
+            logging.info('Standardizing and performing PCA ...')
+            # Standardize observables and transform through PCA.  Use the first
+            # `npc` components but save the full PC transformation for later.
+            standardized_data = self.scaler.fit_transform(data_to_use)
+            Z = self.pca.fit_transform(standardized_data)[:, :self.npc]
+
+            logging.info('{} PCs explain {:.5f} of variance'.format(
+                self.npc, self.pca.explained_variance_ratio_[:self.npc].sum()
+            ))
+
+        nev, nobs = data_to_use.shape
+        logging.info('Train GP emulators with {} training points ...'.format(nev))
+
+        design_points = self.design_points[eventMask, :]
+        if self.parameterTrafoPCA_:
+            design_points = self.PCA_new_design_points[eventMask, :]
 
         # Define kernel (covariance function):
         # Gaussian correlation (RBF) plus a noise term.
         ptp = self.design_max - self.design_min
-
-        rbf_kern = 1. * kernels.RBF(
-                      length_scale=ptp,
-                      length_scale_bounds=np.outer(ptp, (1e-1, 1e2)),
-                   )
+        if kernel_type == "RBF":
+            kernel = 1. * kernels.RBF(
+                          length_scale=ptp,
+                          #length_scale_bounds=np.outer(ptp, (1e-1, 1e2)),
+                          length_scale_bounds=np.outer(ptp, (1e-3, 1e3)),
+                       )
+        elif kernel_type == "Matern":
+            kernel = 1. * kernels.Matern(
+                length_scale=ptp,
+                length_scale_bounds=np.outer(ptp, (1e-3, 1e5)),
+                nu=1.5
+            )
+        else:
+            logging.error("{} kernel not implemented ...".format(kernel_type))
+            
         const_kern = kernels.ConstantKernel()
-
         #homoscedastic noise kernel
         hom_white_kern = kernels.WhiteKernel(
-                                 noise_level=.05,
-                                 noise_level_bounds=(1e-2, 1e2)
-                                 )
-
+                            noise_level=.05,
+                            noise_level_bounds=(1e-2, 1e2)
+                        )
         #heteroscedastic noise kernel
         use_hom_sced_noise = True
-
-        kernel = (rbf_kern + hom_white_kern)
-        #if use_hom_sced_noise:
-        #else:
-        #    n_clusters = 10
-        #    prototypes = KMeans(n_clusters=n_clusters).fit(
-        #                self.design_points[eventMask, :]).cluster_centers_
-        #    het_noise_kern = HeteroscedasticKernel.construct(
-        #        prototypes, 1., (1e-1, 1e1), gamma=1e-5, gamma_bounds="fixed")
-        #    kernel = (rbf_kern + het_noise_kern)
+        if use_hom_sced_noise:
+            kernel = (kernel + hom_white_kern)
+        else:
+            n_clusters = 10
+            prototypes = KMeans(n_clusters=n_clusters).fit(
+                        design_points).cluster_centers_
+            het_noise_kern = HeteroscedasticKernel.construct(
+                prototypes, 1., (1e-1, 1e1), gamma=1e-5, gamma_bounds="fixed")
+            kernel = (kernel + het_noise_kern)
 
         # Fit a GP (optimize the kernel hyperparameters) to each PC.
         self.gps = [
-            GPR(kernel=kernel, alpha=0.1,
+            GPR(kernel=kernel, alpha=0.0001,
                 n_restarts_optimizer=self.nrestarts,
                 copy_X_train=False
-            ).fit(self.design_points[eventMask, :], z)
+            ).fit(design_points, z)
             for z in Z.T
         ]
         gpScores = []
         for i, gp in enumerate(self.gps):
-            gpScores.append(gp.score(self.design_points[eventMask, :], Z.T[i]))
+            gpScores.append(gp.score(design_points, Z.T[i]))
+        logging.info('GP scores: {}'.format(gpScores))
 
-        for n, (evr, gp) in enumerate(zip(
-                self.pca.explained_variance_ratio_, self.gps
-        )):
-            logging.info(
-                'GP {}: {:.5f} of variance, LML = {:.5g}, Score = {:.2f}, kernel: {}'
-                .format(n, evr, gp.log_marginal_likelihood_value_, gpScores[n],
-                        gp.kernel_)
+        for n, gp in enumerate(self.gps):
+            if not self.perform_no_PCA_:
+                evr = self.pca.explained_variance_ratio_[n]
+                logging.info(
+                    'GP {}: {:.5f} of variance, LML = {:.5g}, Score = {:.2f}, kernel: {}'
+                    .format(n, evr, gp.log_marginal_likelihood_value_, gpScores[n],
+                            gp.kernel_)
+                )
+
+        if not self.perform_no_PCA_:
+            # Construct the full linear transformation matrix, which is just the PC
+            # matrix with the first axis multiplied by the explained standard
+            # deviation of each PC and the second axis multiplied by the
+            # standardization scale factor of each observable.
+            self._trans_matrix = (
+                self.pca.components_
+                * np.sqrt(self.pca.explained_variance_[:, np.newaxis])
+                * self.scaler.scale_
             )
 
-        # Construct the full linear transformation matrix, which is just the PC
-        # matrix with the first axis multiplied by the explained standard
-        # deviation of each PC and the second axis multiplied by the
-        # standardization scale factor of each observable.
-        self._trans_matrix = (
-            self.pca.components_
-            * np.sqrt(self.pca.explained_variance_[:, np.newaxis])
-            * self.scaler.scale_
-        )
+            # Pre-calculate some arrays for inverse transforming the predictive
+            # variance (from PC space to physical space).
 
-        # Pre-calculate some arrays for inverse transforming the predictive
-        # variance (from PC space to physical space).
+            # Assuming the PCs are uncorrelated, the transformation is
+            #
+            #   cov_ij = sum_k A_ki var_k A_kj
+            #
+            # where A is the trans matrix and var_k is the variance of the kth PC.
+            # https://en.wikipedia.org/wiki/Propagation_of_uncertainty
 
-        # Assuming the PCs are uncorrelated, the transformation is
-        #
-        #   cov_ij = sum_k A_ki var_k A_kj
-        #
-        # where A is the trans matrix and var_k is the variance of the kth PC.
-        # https://en.wikipedia.org/wiki/Propagation_of_uncertainty
+            # Compute the partial transformation for the first `npc` components
+            # that are actually emulated.
+            A = self._trans_matrix[:self.npc]
+            self._var_trans = np.einsum(
+                'ki,kj->kij', A, A, optimize=False).reshape(self.npc, self.nobs**2)
 
-        # Compute the partial transformation for the first `npc` components
-        # that are actually emulated.
-        A = self._trans_matrix[:self.npc]
-        self._var_trans = np.einsum(
-            'ki,kj->kij', A, A, optimize=False).reshape(self.npc, self.nobs**2)
-
-        # Compute the covariance matrix for the remaining neglected PCs
-        # (truncation error).  These components always have variance == 1.
-        B = self._trans_matrix[self.npc:]
-        self._cov_trunc = np.dot(B.T, B)
-
-        # Add small term to diagonal for numerical stability.
-        self._cov_trunc.flat[::self.nobs + 1] += 1e-4 * self.scaler.var_
-
+            # Compute the covariance matrix for the remaining neglected PCs
+            # (truncation error).  These components always have variance == 1.
+            B = self._trans_matrix[self.npc:]
+            self._cov_trunc = np.dot(B.T, B)
+            # Add small term to diagonal for numerical stability.
+            self._cov_trunc.flat[::self.nobs + 1] += 1e-4 * self.scaler.var_
 
     def _inverse_transform(self, Z):
         """
@@ -203,96 +381,50 @@ class Emulator:
         return Y
 
 
-    def _load_training_data(self, data_path):
+    def _load_training_data_pickle(self, dataFile):
         """This function read in training data set at every sample point"""
-        logging.info("loading training data from {} ...".format(data_path))
+        logging.info("loading training data from {} ...".format(dataFile))
         self.model_data = []
         self.model_data_err = []
         self.design_points = []
-        for iev in glob(path.join(data_path, "*")):
-            event_id = iev.split("_")[-2]
-            temp_data = np.loadtxt(path.join(iev, "Bayesian_output.txt"))
-            statErrMax = np.abs((temp_data[:, 1]/temp_data[:, 0]).max())
-            #if statErrMax > 0.1:
-            #    logging.info("Discard Parameter {}, stat err = {:.2f}".format(
-            #                                        event_id, statErrMax))
-            #    continue
-            with open(path.join(iev, "parameter_{}".format(event_id)), "r") as parfile:
-                parameters = []
-                for line in parfile:
-                    line = line.split()
-                    parameters.append(float(line[1]))
-            self.design_points.append(parameters)
-            if self.logFlag_:
+        with open(dataFile, "rb") as fp:
+            dataDict = pickle.load(fp)
+
+        # Sort keys in ascending order
+        sorted_event_ids = sorted(dataDict.keys(), key=lambda x: int(x))
+
+        discarded_points = 0
+        for event_id in sorted_event_ids:
+            temp_data = dataDict[event_id]["obs"].transpose()
+            statErrMax = np.abs((temp_data[:, 1]/(temp_data[:, 0]+1e-16))).max()
+            if statErrMax > self.max_rel_uncertainty_data_:
+                logging.info("Discard Parameter {}, stat err = {:.2f}".format(
+                                                    event_id, statErrMax))
+                discarded_points += 1
+                continue
+            self.design_points.append(dataDict[event_id]["parameter"])
+            if self.logTrafo_ == False:
+                self.model_data.append(temp_data[:, 0])
+                self.model_data_err.append(temp_data[:, 1])
+            else:
                 self.model_data.append(np.log(np.abs(temp_data[:, 0]) + 1e-30))
                 self.model_data_err.append(
                     np.abs(temp_data[:, 1]/(temp_data[:, 0] + 1e-30))
                 )
-            else:
-                self.model_data.append(temp_data[:, 0])
-                self.model_data_err.append(temp_data[:, 1])
-        logging.info("Training dataset size: {}".format(len(self.model_data)))
         self.design_points = np.array(self.design_points)
         self.design_points_org_ = np.copy(self.design_points)
         self.model_data = np.array(self.model_data)
         self.model_data_err = np.nan_to_num(
                 np.abs(np.array(self.model_data_err)))
-        if self.transformDesign_:
-            self.design_points = self._transform_design(self.design_points)
         logging.info("All training data are loaded.")
+        logging.info("Training dataset size: {}, discarded points: {}".format(
+            len(self.model_data),discarded_points))
 
 
-    def _transform_design(self, X):
-        """This function transform the parameters of bulk viscosity
-        to another representation for better emulation performance.
-        """
-        # pop out the bulk viscous parameters
-        indices = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
-                   12, 13, 14, 16, 17,
-                   21]
-        new_design_X = X[:, indices]
-
-        #now append the values of eta/s and zeta/s at various temperatures
-        num_T = 10
-        Temperature_grid = np.linspace(0.12, 0.35, num_T)
-        #num_muB = 3
-        #muB_grid = np.linspace(0.0, 0.4, num_muB)
-        zeta_vals = []
-        for T_i in Temperature_grid:
-            #for muB_i in muB_grid:
-            zeta_vals.append(
-                self._vec_zeta_s(T_i, 0.0, X[:, 15], X[:, 15], X[:, 15],
-                                 X[:, 18], X[:, 19], X[:, 20])
-            )
-
-        zeta_vals = np.array(zeta_vals).T
-
-        new_design_X = np.concatenate( (new_design_X, zeta_vals), axis=1)
-        return new_design_X
-
-
-    def _zeta_over_s(self, T, muB, bulkMax0, bulkMax1, bulkMax2,
-                     bulkTpeak0, bulkWhigh, bulkWlow):
-        if muB < 0.2:
-            bulkMax = bulkMax0 + (bulkMax1 - bulkMax0)/0.2*muB
-        elif muB < 0.4:
-            bulkMax = bulkMax1 + (bulkMax2 - bulkMax1)/0.2*(muB - 0.2)
-        else:
-            bulkMax = bulkMax2
-        bulkTpeak = bulkTpeak0 - 0.15*muB*muB
-        zeta_s = self._zeta_over_s_base(T, bulkMax, bulkTpeak,
-                                        bulkWhigh, bulkWlow)
-        return zeta_s
-
-
-    def _zeta_over_s_base(self, T, bulkMax, bulkTpeak, bulkWhigh, bulkWlow):
-        Tdiff = T - bulkTpeak
-        if Tdiff > 0:
-            Tdiff /= bulkWhigh
-        else:
-            Tdiff /= bulkWlow
-        zeta_s = bulkMax*np.exp(-Tdiff*Tdiff)
-        return zeta_s
+    def getAvgTrainingDataRelError(self,):
+        relErr = np.mean(np.nan_to_num(self.model_data_err/self.model_data),
+                         axis=0)
+        return(relErr)
 
 
     def print_learning_curve(self):
@@ -311,12 +443,17 @@ class Emulator:
                 noise_level_bounds=(.001**2, 1)
             )
         )
+
+        design_points = self.design_points
+        if self.parameterTrafoPCA_:
+            design_points = self.PCA_new_design_points
+        
         trainStatus = []
         for i, z in enumerate(Z.T):
             train_size_abs, train_scores, test_scores = learning_curve(
                 GPR(kernel=kernel, alpha=0.,
                     copy_X_train=False),
-                self.design_points, z, train_sizes=[0.2, 0.4, 0.6, 0.8, 0.9]
+                design_points, z, train_sizes=[0.2, 0.4, 0.6, 0.8, 0.9]
             )
             output = np.array([train_size_abs, np.mean(train_scores, axis=1),
                                np.mean(test_scores, axis=1)])
@@ -331,7 +468,7 @@ class Emulator:
         return(trainStatus)
 
 
-    def predict(self, X, return_cov=False, extra_std=0):
+    def predict(self, X, return_cov=True, extra_std=0):
         """
         Predict model output at `X`.
 
@@ -358,19 +495,82 @@ class Emulator:
         It may either be a scalar or an array-like of length nsamples.
 
         """
-        if self.transformDesign_:
-            X = self._transform_design(X)
+        if self.parameterTrafoPCA_:
+            if np.ndim(X) == 1:
+                bulk_viscosity_parameters = X[self.indices_zeta_s_parameters]
+            else:
+                bulk_viscosity_parameters = X[:,self.indices_zeta_s_parameters]
+            T_range = np.linspace(0.0, 0.5, 100)
+            data_functions = []
+            for p in range(X.shape[0]):
+                parameter_function = [self.parametrization_zeta_over_s_vs_T(
+                    bulk_viscosity_parameters[p, 0], bulk_viscosity_parameters[p, 1],
+                    bulk_viscosity_parameters[p, 2], bulk_viscosity_parameters[p, 3],
+                    T, 0.0) for T in T_range]
+                data_functions.append(parameter_function)
+            data_functions = np.array(data_functions)
 
-        gp_mean = [gp.predict(X, return_cov=return_cov) for gp in self.gps]
+            scaled_data = self.paramTrafoScaler_bulk.transform(data_functions)
+            projected_parameters = self.paramTrafoPCA_bulk.transform(scaled_data)
+
+            new_theta = np.delete(X, self.indices_zeta_s_parameters, axis=1)
+            new_theta = np.concatenate((new_theta, projected_parameters), axis=1)
+
+            if np.ndim(X) == 1:
+                shear_viscosity_parameters = X[self.indices_eta_s_parameters]
+            else:
+                shear_viscosity_parameters = X[:,self.indices_eta_s_parameters]
+            mu_B_range = np.linspace(0.0, 0.6, 100)
+            data_functions = []
+            for p in range(X.shape[0]):
+                parameter_function = [self.parametrization_eta_over_s_vs_mu_B(
+                    shear_viscosity_parameters[p, 0], shear_viscosity_parameters[p, 1],
+                    shear_viscosity_parameters[p, 2], mu_B) for mu_B in mu_B_range]
+                data_functions.append(parameter_function)
+            data_functions = np.array(data_functions)
+
+            scaled_data = self.paramTrafoScaler_shear.transform(data_functions)
+            projected_parameters = self.paramTrafoPCA_shear.transform(scaled_data)
+
+            new_theta = np.delete(new_theta, self.indices_eta_s_parameters, axis=1)
+            new_theta = np.concatenate((new_theta, projected_parameters), axis=1)
+
+            if np.ndim(X) == 1:
+                yloss_viscosity_parameters = X[self.indices_yloss_parameters]
+            else:
+                yloss_viscosity_parameters = X[:,self.indices_yloss_parameters]
+            yinit_range = np.linspace(0.0, 6.2, 100)
+            data_functions = []
+            for p in range(X.shape[0]):
+                parameter_function = [self.parametrization_y_loss_vs_y_init(
+                    yloss_viscosity_parameters[p, 0], yloss_viscosity_parameters[p, 1],
+                    yloss_viscosity_parameters[p, 2], yinit) for yinit in yinit_range]
+                data_functions.append(parameter_function)
+            data_functions = np.array(data_functions)
+
+            scaled_data = self.paramTrafoScaler_yloss.transform(data_functions)
+            projected_parameters = self.paramTrafoPCA_yloss.transform(scaled_data)
+
+            new_theta = np.delete(new_theta, self.indices_yloss_parameters, axis=1)
+            new_theta = np.concatenate((new_theta, projected_parameters), axis=1)
+
+            gp_mean = [gp.predict(new_theta, return_cov=return_cov) for gp in self.gps]
+        else:
+            gp_mean = [gp.predict(X, return_cov=return_cov) for gp in self.gps]
 
         if return_cov:
             gp_mean, gp_cov = zip(*gp_mean)
 
-        mean = self._inverse_transform(
-            np.concatenate([m[:, np.newaxis] for m in gp_mean], axis=1)
-        )
+        if not self.perform_no_PCA_:
+            mean = self._inverse_transform(
+                np.concatenate([m[:, np.newaxis] for m in gp_mean], axis=1)
+            )
+        else:
+            mean = self.scaler.inverse_transform(
+                np.concatenate([m[:, np.newaxis] for m in gp_mean], axis=1)
+            )
 
-        if self.logFlag_:
+        if self.exp_and_cov_diag_:
             mean = np.exp(mean)
 
         if return_cov:
@@ -381,18 +581,30 @@ class Emulator:
             ], axis=1)
 
             # Add extra uncertainty to predictive variance.
-            extra_std = np.array(extra_std, copy=False).reshape(-1, 1)
+            #extra_std = np.array(extra_std, copy=False).reshape(-1, 1)
+            extra_std = np.asarray(extra_std).reshape(-1, 1)
             gp_var += extra_std**2
 
-            # Compute the covariance at each sample point using the
-            # pre-calculated arrays (see constructor).
-            cov = np.dot(gp_var, self._var_trans).reshape(
-                X.shape[0], self.nobs, self.nobs
-            )
-            cov += self._cov_trunc
+            if not self.perform_no_PCA_:
+                # Compute the covariance at each sample point using the
+                # pre-calculated arrays (see constructor).
+                cov = np.dot(gp_var, self._var_trans).reshape(
+                    X.shape[0], self.nobs, self.nobs
+                )
+                cov += self._cov_trunc
+            else:
+                # create a covariance matrix for each sample point from gp_var
+                cov = np.zeros((X.shape[0], self.nobs, self.nobs))
+                for i in range(X.shape[0]):
+                    cov[i] = np.diag(gp_var[i])
 
-            if self.logFlag_:
-                cov = cov*((mean**2).reshape(X.shape[0], self.nobs, 1))
+            if self.exp_and_cov_diag_:
+                # for each prediction set the off diagonal elements to zero
+                for i in range(X.shape[0]):
+                    new_cov = np.zeros((self.nobs, self.nobs))
+                    fstd = np.sqrt(np.diag(cov[i]))
+                    np.fill_diagonal(new_cov, (fstd*mean[i])**2.)
+                    cov[i] = new_cov
 
             return mean, cov
         else:
@@ -409,72 +621,127 @@ class Emulator:
         """
         # Sample the GP for each emulated PC.  The remaining components are
         # assumed to have a standard normal distribution.
-        if self.transformDesign_:
-            X = self._transform_design(X)
-        return self._inverse_transform(
-            np.concatenate([
-                gp.sample_y(
-                    X, n_samples=n_samples, random_state=random_state
-                )[:, :, np.newaxis]
-                for gp in self.gps
-            ] + [
-                np.random.standard_normal(
-                    (X.shape[0], n_samples, self.pca.n_components_ - self.npc)
-                )
-            ], axis=2)
-        )
+        if not self.perform_no_PCA_:
+            return self._inverse_transform(
+                np.concatenate([
+                    gp.sample_y(
+                        X, n_samples=n_samples, random_state=random_state
+                    )[:, :, np.newaxis]
+                    for gp in self.gps
+                ] + [
+                    np.random.standard_normal(
+                        (X.shape[0], n_samples, self.pca.n_components_ - self.npc)
+                    )
+                ], axis=2)
+            )
+        else:
+            return np.concatenate([
+                    gp.sample_y(
+                        X, n_samples=n_samples, random_state=random_state
+                    )[:, :, np.newaxis]
+                    for gp in self.gps
+                ] + [
+                    np.random.standard_normal(
+                        (X.shape[0], n_samples, self.pca.n_components_ - self.npc) #TODO Here is some thinking needed!
+                    )
+                ], axis=2)
 
 
-    def testEmulatorErrors(self, nTestPoints=1, nIters=1):
+
+    def testEmulatorErrors(self, nTestPoints=1):
         """
         This function uses (nev - nTestPoints) points to train the emulator
         and use nTestPoints points to test the emulator in each iteration.
-        In each iteraction, the nTestPoints data points are randomly
-        chosen.
         It returns the emulator predictions, their errors,
-        the actual values of observabels and their errors as four arrays.
+        the actual values of observables and their errors as four arrays.
         """
-        rng = np.random.default_rng()
         emulatorPreds = []
         emulatorPredsErr = []
         validationData = []
         validationDataErr = []
-        for iter_i in range(nIters):
-            logging.info(
-                    "Validating GP emulators iter = {} ...".format(iter_i))
-            eventIdxList = rng.choice(self.nev, nTestPoints, replace=False)
-            trainEventMask = [True]*self.nev
-            for event_i in eventIdxList:
-                trainEventMask[event_i] = False
-            self.trainEmulator(trainEventMask)
-            validateEventMask = [not i for i in trainEventMask]
-            pred, predCov = self.predict(
-                self.design_points_org_[validateEventMask, :], return_cov=True)
-            emulatorPreds.append(pred)
-            predErr = np.zeros([nTestPoints, self.nobs])
-            for iobs in range(self.nobs):
-                predErr[:, iobs] = np.sqrt(predCov[:, iobs, iobs])
-            emulatorPredsErr.append(predErr)
-            if self.logFlag_:
-                validationData.append(
-                        np.exp(self.model_data[validateEventMask, :])
-                )
-                validationDataErr.append(
-                        self.model_data_err[validateEventMask, :]
-                        *np.exp(self.model_data[validateEventMask, :])
-                )
-            else:
-                validationData.append(self.model_data[validateEventMask, :])
-                validationDataErr.append(
-                        self.model_data_err[validateEventMask, :]
-                )
+
+        logging.info("Validating GP emulator ...")
+        eventIdxList = range(self.nev - nTestPoints, self.nev)
+        trainEventMask = [True]*self.nev
+        for event_i in eventIdxList:
+            trainEventMask[event_i] = False
+        # randomly set number_test_points in train_event_mask to False
+        #random_indices = np.random.choice(range(self.nev), nTestPoints, replace=False)
+        #for event_i in random_indices:
+        #    trainEventMask[event_i] = False
+        self.trainEmulator(trainEventMask)
+        validateEventMask = [not i for i in trainEventMask]
+
+        pred, predCov = self.predict(
+            self.design_points_org_[validateEventMask, :], return_cov=True)
+        pred_var = np.sqrt(np.array([predCov[i].diagonal() for i in range(predCov.shape[0])]))
+        
+        if self.logTrafo_ and not self.exp_and_cov_diag_:
+            emulatorPreds = np.exp(pred)
+            emulatorPredsErr = pred_var*np.exp(pred)
+        else:
+            emulatorPreds = pred
+            emulatorPredsErr = pred_var
+        
+        if self.logTrafo_:
+            validationData = np.exp(self.model_data[validateEventMask, :])
+            validationDataErr = self.model_data_err[validateEventMask, :]*np.exp(self.model_data[validateEventMask, :])
+        else:
+            validationData = self.model_data[validateEventMask, :]
+            validationDataErr = self.model_data_err[validateEventMask, :]
+        
         emulatorPreds = np.array(emulatorPreds).reshape(-1, self.nobs)
         emulatorPredsErr = np.array(emulatorPredsErr).reshape(-1, self.nobs)
         validationData = np.array(validationData).reshape(-1, self.nobs)
         validationDataErr = np.array(validationDataErr).reshape(-1, self.nobs)
-        return(emulatorPreds, emulatorPredsErr,
+        return (emulatorPreds, emulatorPredsErr,
                validationData, validationDataErr)
+    
+    def testEmulatorErrorsWithTrainingPoints(self, nTestPoints=1):
+        """
+        This function uses number_test_points points to train the 
+        emulator and the same points to test the emulator in each 
+        iteration. The resulting errors should be very small.
+        It returns the emulator predictions, their errors,
+        the actual values of observables and their errors as four arrays.
+        """
+        emulatorPreds = []
+        emulatorPredsErr = []
+        validationData = []
+        validationDataErr = []
 
+        logging.info("Validating GP emulator ...")
+        eventIdxList = range(self.nev - nTestPoints, self.nev)
+        trainEventMask = [True]*self.nev
+        for event_i in eventIdxList:
+            trainEventMask[event_i] = False
+        self.trainEmulator(trainEventMask)
+        validateEventMask = [i for i in trainEventMask] # here is the difference to the previous function
+
+        pred, predCov = self.predict(
+            self.design_points_org_[validateEventMask, :], return_cov=True)
+        pred_var = np.sqrt(np.array([predCov[i].diagonal() for i in range(predCov.shape[0])]))
+        
+        if self.logTrafo_ and not self.exp_and_cov_diag_:
+            emulatorPreds = np.exp(pred)
+            emulatorPredsErr = pred_var*np.exp(pred)
+        else:
+            emulatorPreds = pred
+            emulatorPredsErr = pred_var
+        
+        if self.logTrafo_:
+            validationData = np.exp(self.model_data[validateEventMask, :])
+            validationDataErr = self.model_data_err[validateEventMask, :]*np.exp(self.model_data[validateEventMask, :])
+        else:
+            validationData = self.model_data[validateEventMask, :]
+            validationDataErr = self.model_data_err[validateEventMask, :]
+        
+        emulatorPreds = np.array(emulatorPreds).reshape(-1, self.nobs)
+        emulatorPredsErr = np.array(emulatorPredsErr).reshape(-1, self.nobs)
+        validationData = np.array(validationData).reshape(-1, self.nobs)
+        validationDataErr = np.array(validationDataErr).reshape(-1, self.nobs)
+        return (emulatorPreds, emulatorPredsErr,
+               validationData, validationDataErr)
 
 
 if __name__ == '__main__':
